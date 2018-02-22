@@ -20,8 +20,11 @@ class E3SMDiags(object):
     def __init__(self, config, event_list):
         self.event_list = event_list
         self.inputs = {
+            'short_name': '',
+            'account': '',
             'ui': '',
             'regrid_base_path': '',
+            'regrid_output_path': '',
             'regrided_climo_path': '',
             'reference_data_path': '',
             'test_data_path': '',
@@ -39,12 +42,6 @@ class E3SMDiags(object):
             'web_dir': '',
             'host_url': '',
             'output_path': ''
-        }
-        self.slurm_args = {
-            'num_cores': '-n 16',  # 16 cores
-            'run_time': '-t 0-05:00',  # 2 hour max run time
-            'num_machines': '-N 1',  # run on one machine
-            'oversubscribe': '--oversubscribe'
         }
         self.start_time = None
         self.end_time = None
@@ -83,6 +80,8 @@ class E3SMDiags(object):
 
         valid = True
         for key, val in self.config.items():
+            if key == 'account':
+                continue
             if val == '':
                 valid = False
                 msg = '{0}: {1} is missing or empty'.format(key, val)
@@ -122,12 +121,14 @@ class E3SMDiags(object):
         if self.postvalidate():
             self.status = JobStatus.COMPLETED
             return 0
+
         # render the parameters file
         self.output_path = self.config['output_path']
         template_out = os.path.join(
             self.output_path,
             'params.py')
         variables = {
+            'short_name': self.config['short_name'],
             'sets': self.config['sets'],
             'backend': self.config['backend'],
             'reference_data_path': self.config['reference_data_path'],
@@ -152,16 +153,6 @@ class E3SMDiags(object):
             src=template_out,
             dst=template_copy)
 
-        # Create directory of regridded climos
-        file_list = get_climo_output_files(
-            input_path=self.config['regrid_base_path'],
-            start_year=self.start_year,
-            end_year=self.end_year)
-        create_symlink_dir(
-            src_dir=self.config['regrid_base_path'],
-            src_list=file_list,
-            dst=self.config['regrided_climo_path'])
-
         # setup sbatch script
         run_script = os.path.join(
             self.config.get('run_scripts_path'),
@@ -169,19 +160,26 @@ class E3SMDiags(object):
         if os.path.exists(run_script):
             os.remove(run_script)
 
-        self.slurm_args['output_file'] = '-o {output_file}'.format(
-            output_file=run_script + '.out')
-
-        cmd = 'acme_diags_driver.py -p {template}'.format(
-            template=template_out)
-
-        slurm_args_str = ['#SBATCH {value}\n'.format(
-            value=v) for k, v in self.slurm_args.items()]
-        slurm_prefix = ''.join(slurm_args_str)
-        with open(run_script, 'w') as batchfile:
-            batchfile.write('#!/bin/bash\n')
-            batchfile.write(slurm_prefix)
-            batchfile.write(cmd)
+        # Create directory of regridded climos
+        file_list = get_climo_output_files(
+            input_path=self.config['regrid_output_path'],
+            start_year=self.start_year,
+            end_year=self.end_year)
+        variables = {
+            'ACCOUNT': self.config.get('account', ''),
+            'SRC_LIST': file_list,
+            'SRC_DIR': self.config['regrid_output_path'],
+            'DST': self.config['regrided_climo_path'],
+            'CONSOLE_OUTPUT': '{}.out'.format(run_script),
+            'PARAMS_PATH': template_out
+        }
+        resource_dir, _ = os.path.split(self.config.get('template_path'))
+        submission_template_path = os.path.join(
+            resource_dir, 'e3sm_diags_submission_template.sh')
+        render(
+            variables=variables,
+            input_path=submission_template_path,
+            output_path=run_script)
 
         slurm = Slurm()
         msg = 'Submitting to queue {type}: {start:04d}-{end:04d}'.format(
@@ -198,15 +196,6 @@ class E3SMDiags(object):
         self.status = StatusMap[status.get('JobState')]
 
         return self.job_id
-
-    def __str__(self):
-        return pformat({
-            'type': self.type,
-            'status': self.status,
-            'depends_on': self.depends_on,
-            'job_id': self.job_id,
-            'year_set': self.year_set
-        }, indent=4)
 
     @property
     def type(self):

@@ -31,6 +31,7 @@ class Timeseries(object):
         self.config = {}
         self._status = JobStatus.INVALID
         self._type = 'timeseries'
+        self.filemanager = config['filemanager']
         self.year_set = config.get('year_set', 0)
         self.start_year = config['start_year']
         self.end_year = config['end_year']
@@ -40,12 +41,14 @@ class Timeseries(object):
         self.end_time = None
         self.output_path = None
         self.inputs = {
+            'account': '',
             'ui': '',
             'year_set': '',
             'annual_mode': '',
             'start_year': '',
             'end_year': '',
-            'output_directory': '',
+            'native_output_directory': '',
+            'regrid_output_directory': '',
             'var_list': '',
             'caseId': '',
             'run_scripts_path': '',
@@ -66,16 +69,33 @@ class Timeseries(object):
         """
         if self.status == JobStatus.VALID:
             return 0
+        invalid = False
         for i in config:
             if i in self.inputs:
                 self.config[i] = config.get(i)
+
+        account = self.config.get('account')
+        if account:
+            self.slurm_args['account'] = '-A {}'.format(account)
+
+        # make sure the run_scripts_path is setup
         if not os.path.exists(self.config.get('run_scripts_path')):
             os.makedirs(self.config.get('run_scripts_path'))
+        # make sure the var_list is setup
+        if not self.config.get('var_list'):
+            invalid = True
+        if not isinstance(self.config.get('var_list'), list):
+            self.config['var_list'] = [self.config.get('var_list')]
+        # make sure the job has been added to a year_set
         if self.year_set == 0:
-            self.status = JobStatus.INVALID
+            invalid = True
             return
-        self.output_path = self.config['output_directory']
-        self.status = JobStatus.VALID
+        self.output_path = self.config['regrid_output_directory']
+
+        if invalid:
+            self.status = JobStatus.INVALID
+        else:
+            self.status = JobStatus.VALID
 
     def __str__(self):
         return json.dumps({
@@ -95,17 +115,22 @@ class Timeseries(object):
             self.status = JobStatus.COMPLETED
             return 0
 
-        file_list = self.config['file_list']
+        file_list = self.filemanager.get_file_paths_by_year(
+            start_year=self.start_year,
+            end_year=self.end_year,
+            _type='atm')
         file_list.sort()
         list_string = ' '.join(file_list)
         slurm_command = ' '.join([
-            'ncclimo',
+            '~zender1/bin/ncclimo',
             '-a', self.config['annual_mode'],
             '-c', self.config['caseId'],
             '-v', ','.join(self.config['var_list']),
             '-s', str(self.config['start_year']),
             '-e', str(self.config['end_year']),
-            '-o', self.config['output_directory'],
+            '--ypf={}'.format(self.end_year - self.start_year + 1),
+            '-o', self.config['regrid_output_directory'],
+            '-O', self.config['native_output_directory'],
             '--map={}'.format(self.config.get('regrid_map_path')),
             list_string
         ])
@@ -146,35 +171,29 @@ class Timeseries(object):
         return self.job_id
 
     def _find_year(self, filename):
-        pattern = '_\d\d\d\d\d\d_\d\d\d\d\d\d.*'
+        pattern = r'\d{6}_\d{6}'
         match = re.search(pattern=pattern, string=filename)
         if not match:
             return False, False
-        start = int(filename[match.start() + 1: match.start() + 5])
-        end = int(filename[match.start() + 8: match.start() + 12])
+        start = int(filename[match.start(): match.start() + 4])
+        end = int(filename[match.start() + 7: match.start() + 11])
         return start, end
 
     def postvalidate(self):
         """
         Post execution validation
         """
-        output_dir = os.listdir(self.config.get('output_directory'))
-        if not isinstance(self.config.get('var_list'), list):
-            self.config['var_list'] = [self.config.get('var_list')]
-        complete = True
-        for var in self.config.get('var_list'):
-            found = False
-            for out in output_dir:
-                if var in out:
-                    start, end = self._find_year(out)
-                    if start == self.config['start_year'] and end == self.config['end_year']:
-                        found = True
-                        break
-
-            if not found:
-                complete = False
-                break
-        return complete
+        for path in [self.config.get('native_output_directory'), self.config.get('regrid_output_directory')]:
+            contents = os.listdir(path)
+            
+            # Loop through each variable and make sure its been put into the output directory
+            for var in self.config.get('var_list'):
+                pattern = '{var}_{start:04d}01_{end:04d}12'.format(
+                    var=var, start=self.start_year, end=self.end_year)
+                file_list = [x for x in contents if re.search(string=x, pattern=pattern)]
+                if not file_list:
+                    return False
+        return True
 
     @property
     def type(self):

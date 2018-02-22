@@ -141,7 +141,7 @@ set cntl_filetype   =  monthly_history
 
 set cntl_path_history = /glade/scratch/hannay/archive/$cntl_casename/atm/hist/ 
 set cntl_path_climo   = /glade/scratch/hannay/amwg/climo/$cntl_casename/  
-#set cntl_path_HPSS    = /CCSM/csm/${cntl_casename}/atm/hist/
+#set cntl_path_HPSS    = NONE
 
 #******************************************************************
 
@@ -310,7 +310,7 @@ set tick_marks = 1       # (0=ON,1=OFF)
 set custom_names = 0     # (0=ON,1=OFF)
 
 # if needed set the names
-set test_name = $test_casename                    # test case name 
+set test_name = %%short_name%%            # test case name 
 set cntl_name = cam3_5_cntl               # control case name
 
 #----------------------------------------------------------------

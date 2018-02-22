@@ -46,6 +46,9 @@ class AMWGDiagnostic(object):
         self.output_path = None
         self.year_set = config.get('year_set', 0)
         self.inputs = {
+            'short_name': '',
+            'account': '',
+            'simulation_start_year': '',
             'ui': '',
             'web_dir': '',
             'host_url': '',
@@ -71,12 +74,6 @@ class AMWGDiagnostic(object):
         self.job_id = 0
         self.depends_on = ['ncclimo']
         self.host_suffix = '/index.html'
-        self.slurm_args = {
-            'num_cores': '-n 16',  # 16 cores
-            'run_time': '-t 0-05:00',  # 2 hours run time
-            'num_machines': '-N 1',  # run on one machine
-            'oversubscribe': '--oversubscribe'
-        }
         self.prevalidate(config)
 
     def __str__(self):
@@ -137,10 +134,7 @@ class AMWGDiagnostic(object):
             return 0
 
         # Create directory of regridded climos
-
-        regrid_path = os.path.join(
-            os.sep.join(self.config['test_path_diag'].split(os.sep)[:-2]),
-            'climo_regrid')
+        regrid_path = self.config['regrided_climo_path']
         file_list = get_climo_output_files(
             input_path=regrid_path,
             start_year=self.start_year,
@@ -165,20 +159,6 @@ did you add ncclimo to this year_set?""".format(start=self.start_year,
                 event_list=self.event_list,
                 current_state=True)
             os.makedirs(self.config['test_path_climo'])
-        create_symlink_dir(
-            src_dir=regrid_path,
-            src_list=file_list,
-            dst=self.config['test_path_climo'])
-
-        # Rename the files to the format amwg expects
-        for item in os.listdir(self.config['test_path_climo']):
-            search = re.search(r'\_\d\d\d\d\d\d\_', item)
-            if not search:
-                continue
-            index = search.start()
-            os.rename(
-                os.path.join(self.config['test_path_climo'], item),
-                os.path.join(self.config['test_path_climo'], item[:index] + '_climo.nc'))
 
         # render the csh script into the output directory
         self.output_path = self.config['output_path']
@@ -203,24 +183,27 @@ did you add ncclimo to this year_set?""".format(start=self.start_year,
             dst=run_script_template_out)
 
         # setup sbatch script
-
         run_script = os.path.join(
             self.config.get('run_scripts_path'),
             expected_name)
         if os.path.exists(run_script):
             os.remove(run_script)
 
-        self.slurm_args['output_file'] = '-o {output_file}'.format(
-            output_file=run_script + '.out')
-        cmd = '\ncsh {template}'.format(
-            template=template_out)
-        slurm_args_str = ['#SBATCH {value}'.format(
-            value=v) for k, v in self.slurm_args.items()]
-        slurm_prefix = '\n'.join(slurm_args_str)
-        with open(run_script, 'w') as batchfile:
-            batchfile.write('#!/bin/bash\n')
-            batchfile.write(slurm_prefix)
-            batchfile.write(cmd)
+        variables = {
+            'ACCOUNT': self.config.get('account', ''),
+            'SRC_DIR': regrid_path,
+            'SRC_LIST': file_list,
+            'DST': self.config['test_path_climo'],
+            'CONSOLE_OUT': '{}.out'.format(run_script),
+            'RUN_AMWG_PATH': template_out
+        }
+        resource_dir, _ = os.path.split(self.config.get('template_path'))
+        submission_template_path = os.path.join(
+            resource_dir, 'amwg_submission_template.sh')
+        render(
+            variables=variables,
+            input_path=submission_template_path,
+            output_path=run_script)
 
         if dryrun:
             self.status = JobStatus.COMPLETED

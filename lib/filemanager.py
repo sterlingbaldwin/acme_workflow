@@ -251,7 +251,11 @@ class FileManager(object):
             experiment (str): the name of the experiment
                 ex: 20170915.beta2.A_WCYCL1850S.ne30_oECv3_ICG.edison
         """
-        print 'Creating file table'
+        msg = 'Creating file table'
+        print_line(
+            ui=False,
+            line=msg,
+            event_list=self.event_list)
         if self.sta:
             msg = 'Using short term archive'
         else:
@@ -274,7 +278,8 @@ class FileManager(object):
                 elif _type == 'meridionalHeatTransport':
                     self.populate_heat_transport(newfiles)
                 else:
-                    self.populate_monthly(_type, newfiles, simstart, simend, experiment)
+                    self.populate_monthly(
+                        _type, newfiles, simstart, simend, experiment)
             msg = 'Inserting file data into the table'
             print_line(
                 ui=self.ui,
@@ -338,8 +343,11 @@ class FileManager(object):
             self.remote_endpoint, if_expires_in=2880)
         if result['code'] == "AutoActivationFailed":
             return False
+
+        # First handle the short term archive case
         if self.sta:
             for _type in self.types:
+                # if the type is restart, handle the special cases
                 if _type == 'rest':
                     if not self.updated_rest:
                         self.mutex.acquire()
@@ -393,7 +401,7 @@ class FileManager(object):
                 else:
                     remote_path = os.path.join(
                         self.remote_path, 'archive', _type, 'hist')
-                
+
                 if _type not in ['rest', 'mpascice.rst']:
                     msg = 'Querying globus for {}'.format(_type)
                     print_line(
@@ -413,9 +421,9 @@ class FileManager(object):
                         for idx in range(0, len(names), step):
                             batch_names = names[idx: idx + step]
                             to_update_name = [x['name']
-                                            for x in res if x['name'] in batch_names]
+                                              for x in res if x['name'] in batch_names]
                             to_update_size = [x['size']
-                                            for x in res if x['name'] in batch_names]
+                                              for x in res if x['name'] in batch_names]
                             q = DataFile.update(
                                 remote_status=filestatus['EXISTS'],
                                 remote_size=to_update_size[to_update_name.index(
@@ -426,7 +434,7 @@ class FileManager(object):
                             n = q.execute()
                     except Exception as e:
                         print_debug(e)
-                        print "Do you have the correct start and end dates?"
+                        print "Do you have the correct start and end dates and experiment name?"
                     except OperationalError as operror:
                         line = 'Error writing to database, database is locked by another process'
                         print_line(
@@ -451,9 +459,9 @@ class FileManager(object):
                     for idx in range(0, len(names), step):
                         batch_names = names[idx: idx + step]
                         to_update_name = [x['name']
-                                        for x in res if x['name'] in batch_names]
+                                          for x in res if x['name'] in batch_names]
                         to_update_size = [x['size']
-                                        for x in res if x['name'] in batch_names]
+                                          for x in res if x['name'] in batch_names]
                         q = DataFile.update(
                             remote_status=filestatus['EXISTS'],
                             remote_size=to_update_size[to_update_name.index(
@@ -534,7 +542,7 @@ class FileManager(object):
         self.mutex.acquire()
         try:
             datafiles = DataFile.select().where(
-                DataFile.local_status == filestatus['NOT_EXIST'])
+                DataFile.local_status == filestatus['NOT_EXIST']).execute()
             for datafile in datafiles:
                 should_save = False
                 if os.path.exists(datafile.local_path):
@@ -693,7 +701,8 @@ class FileManager(object):
 
     def _handle_transfer(self, transfer, event, event_list):
         self.active_transfers += 1
-        sleep(random.uniform(0.01, 0.1)) # this is to stop the simultanious print issue
+        # this is to stop the simultanious print issue
+        sleep(random.uniform(0.01, 0.1))
         transfer.execute(event)
         self.active_transfers -= 1
 
@@ -707,7 +716,7 @@ class FileManager(object):
             return
         else:
             self.transfer_cleanup(transfer)
-    
+
     def transfer_cleanup(self, transfer):
         try:
             self.mutex.acquire()
@@ -749,6 +758,7 @@ class FileManager(object):
                 self.mutex.release()
         except:
             pass
+
     def years_ready(self, start_year, end_year):
         """
         Checks if atm files exist from start year to end of endyear
@@ -789,16 +799,23 @@ class FileManager(object):
             return -1
 
     def get_file_paths_by_year(self, start_year, end_year, _type):
+        monthly = ['atm', 'ocn', 'ice']
         self.mutex.acquire()
         try:
-            if _type in ['rest', 'streams.ocean', 'streams.cice', 'mpas-cice_in', 'mpas-o_in', 'meridionalHeatTransport', 'mpascice.rst']:
-                datafiles = DataFile.select().where(DataFile.datatype == _type)
+            if _type not in monthly:
+                datafiles = DataFile.select().where(
+                    (DataFile.datatype == _type) &
+                    (DataFile.local_status == filestatus['EXISTS']))
             else:
                 datafiles = DataFile.select().where(
                     (DataFile.datatype == _type) &
                     (DataFile.year >= start_year) &
-                    (DataFile.year <= end_year))
-            files = [x.local_path for x in datafiles]
+                    (DataFile.year <= end_year) &
+                    (DataFile.local_status == filestatus['EXISTS']))
+            if datafiles is None or len(datafiles) == 0:
+                files = []
+            else:
+                files = [x.local_path for x in datafiles]
         except Exception as e:
             print_debug(e)
             files = []

@@ -4,13 +4,14 @@ import time
 import re
 from datetime import datetime
 from threading import Thread
-from shutil import copytree
+from shutil import copytree, move, copytree, rmtree, copy2
 from subprocess import Popen
 
 from lib.slurm import Slurm
 from lib.util import (get_climo_output_files,
                       create_symlink_dir,
-                      print_line)
+                      print_line,
+                      render)
 
 from lib.YearSet import YearSet, SetStatus
 from jobs.Ncclimo import Climo
@@ -22,7 +23,9 @@ from jobs.JobStatus import JobStatus, StatusMap, ReverseMap
 
 
 class RunManager(object):
-    def __init__(self, event_list, output_path, caseID, scripts_path, thread_list, event, ui):
+    def __init__(self, event_list, output_path, caseID, scripts_path, thread_list, event, ui, resource_path, account, short_name):
+        self.short_name = short_name
+        self.account = account
         self.ui = ui
         self.output_path = output_path
         self.slurm = Slurm()
@@ -35,23 +38,29 @@ class RunManager(object):
         self.kill_event = event
         self._dryrun = False
         self.scripts_path = scripts_path
-        self.max_running_jobs = 6
+        self._resource_path = resource_path
+        self.max_running_jobs = self.slurm.get_node_number() * 6
         if not os.path.exists(self.scripts_path):
             os.makedirs(self.scripts_path)
-    
+
     def check_max_running_jobs(self):
         """
         Checks if the maximum number of jobs are running
-        
+
         Returns True if the max or more are running, false otherwise
         """
-        job_info = self.slurm.queue()
-        running_jobs = 0
-        for job in job_info:
-            if job['STATE'] in ['R', 'PD']:
-                running_jobs += 1
-        return bool(running_jobs >= self.max_running_jobs)
-
+        try:
+            job_info = self.slurm.queue()
+        except:
+            return True
+        else:
+            running_jobs = 0
+            for job in job_info:
+                if job['STATE'] in ['R', 'PD']:
+                    running_jobs += 1
+                if running_jobs >= self.max_running_jobs:
+                    return True
+            return False
 
     def setup_job_sets(self, set_frequency, sim_start_year, sim_end_year, config, filemanager):
         sim_length = sim_end_year - sim_start_year + 1
@@ -133,15 +142,26 @@ class RunManager(object):
             end=end_year)
 
         atm_path = os.path.join(
-            config['global']['project_path'], 'input', 'atm')
+            config['global']['input_path'],
+            'atm')
         output_base_path = config['global']['output_path']
         run_scripts_path = config['global']['run_scripts_path']
+        regrid_map_name = config['global']['remap_grid_name']
+        native_map_name = config['global']['native_grid_name']
 
-        regrid_output_dir = os.path.join(
-            output_base_path,
-            'climo_regrid')
-        if not os.path.exists(regrid_output_dir):
-            os.makedirs(regrid_output_dir)
+        regrid_output_path = os.path.join(
+            output_base_path, 'pp',
+            regrid_map_name, 'climo',
+            '{}yr'.format(year_set.length))
+        if not os.path.exists(regrid_output_path):
+            os.makedirs(regrid_output_path)
+
+        native_output_path = os.path.join(
+            output_base_path, 'pp',
+            native_map_name, 'climo',
+            '{}yr'.format(year_set.length))
+        if not os.path.exists(native_output_path):
+            os.makedirs(native_output_path)
 
         if required_jobs.get('ncclimo'):
             # Add the ncclimo job to the runmanager
@@ -151,24 +171,36 @@ class RunManager(object):
                 year_set=year_set,
                 input_path=atm_path,
                 regrid_map_path=config['ncclimo']['regrid_map_path'],
-                output_path=output_base_path,
-                regrid_output_dir=regrid_output_dir)
+                native_output_path=native_output_path,
+                regrid_output_path=regrid_output_path)
 
         if required_jobs.get('timeseries'):
-            file_list = filemanager.get_file_paths_by_year(
-                start_year=year_set.set_start_year,
-                end_year=year_set.set_end_year,
-                _type='atm')
+
+            regrid_output_path_ts = os.path.join(
+                output_base_path, 'pp',
+                regrid_map_name, 'ts', 'monthly',
+                '{}yr'.format(year_set.length))
+            if not os.path.exists(regrid_output_path_ts):
+                os.makedirs(regrid_output_path_ts)
+
+            native_output_path = os.path.join(
+                output_base_path, 'pp',
+                native_map_name, 'ts', 'monthly',
+                '{}yr'.format(year_set.length))
+            if not os.path.exists(native_output_path):
+                os.makedirs(native_output_path)
+
             # Add the timeseries job to the runmanager
             self.add_timeseries(
+                filemanager=filemanager,
                 start_year=year_set.set_start_year,
                 end_year=year_set.set_end_year,
                 year_set=year_set,
                 input_path=atm_path,
                 regrid_map_path=config['ncclimo']['regrid_map_path'],
                 var_list=config['ncclimo']['var_list'],
-                output_path=output_base_path,
-                file_list=file_list)
+                regrid_output_path=regrid_output_path_ts,
+                native_output_path=native_output_path)
 
         if required_jobs.get('aprime') or required_jobs.get('aprime_diags'):
             # Add the aprime job
@@ -179,13 +211,35 @@ class RunManager(object):
             host_url = '/'.join([
                 config['global']['img_host_server'],
                 os.environ['USER'],
-                host_directory])
+                config['global']['experiment'],
+                'a-prime', '{start:04d}-{end:04d}'.format(
+                    start=year_set.set_start_year,
+                    end=year_set.set_end_year)])
             web_directory = os.path.join(
                 config['global']['host_directory'],
                 os.environ['USER'],
                 host_directory)
+            target_host_path = os.path.join(
+                config['global']['host_directory'],
+                os.environ['USER'],
+                config['global']['experiment'],
+                'a-prime', '{start:04d}-{end:04d}'.format(
+                    start=year_set.set_start_year,
+                    end=year_set.set_end_year))
+
+            output_path = os.path.join(
+                output_base_path, 'diags',
+                regrid_map_name, 'a-prime',
+                '{start:04d}-{end:04d}'.format(
+                    start=year_set.set_start_year,
+                    end=year_set.set_end_year))
+            if not os.path.exists(output_path):
+                os.makedirs(output_path)
 
             self.add_aprime(
+                simulation_start_year=config['global']['simulation_start_year'],
+                target_host_path=target_host_path,
+                output_path=output_path,
                 web_directory=web_directory,
                 host_url=host_url,
                 start_year=year_set.set_start_year,
@@ -213,6 +267,15 @@ class RunManager(object):
                 config.get('amwg').get('host_directory'),
                 set_string])
 
+            output_path = os.path.join(
+                output_base_path, 'diags',
+                regrid_map_name, 'amwg',
+                '{start:04d}-{end:04d}'.format(
+                    start=year_set.set_start_year,
+                    end=year_set.set_end_year))
+            if not os.path.exists(output_path):
+                os.makedirs(output_path)
+
             self.add_amwg(
                 start_year=year_set.set_start_year,
                 end_year=year_set.set_end_year,
@@ -220,8 +283,8 @@ class RunManager(object):
                 resource_path=config['global']['resource_dir'],
                 web_directory=web_directory,
                 host_url=host_url,
-                output_path=output_base_path,
-                regrid_path=regrid_output_dir,
+                output_path=output_path,
+                regrid_path=regrid_output_path,
                 diag_home=config['amwg']['diag_home'])
 
         if required_jobs.get('e3sm_diags') or required_jobs.get('acme_diags'):
@@ -239,7 +302,17 @@ class RunManager(object):
                 config['e3sm_diags']['host_directory'],
                 set_string])
 
+            output_path = os.path.join(
+                output_base_path, 'diags',
+                regrid_map_name, 'e3sm_diags',
+                '{start:04d}-{end:04d}'.format(
+                    start=year_set.set_start_year,
+                    end=year_set.set_end_year))
+            if not os.path.exists(output_path):
+                os.makedirs(output_path)
+
             self.add_e3sm(
+                regrid_output_path=regrid_output_path,
                 start_year=year_set.set_start_year,
                 end_year=year_set.set_end_year,
                 year_set=year_set,
@@ -247,7 +320,7 @@ class RunManager(object):
                 web_directory=web_directory,
                 host_url=host_url,
                 reference_data_path=config['e3sm_diags']['reference_data_path'],
-                output_path=output_base_path,
+                output_path=output_path,
                 seasons=config['e3sm_diags']['seasons'],
                 backend=config['e3sm_diags']['backend'],
                 sets=config['e3sm_diags']['sets'])
@@ -262,27 +335,22 @@ class RunManager(object):
             year_set (int): the set number
             input_path (str): the path to the raw cam.h0 files
             regrid_map_path (str): the path to the regrid map
+            regrid_output_path (str): the output path for regridded climos
+            native_output_path (str): the output path for native climos
         """
         start_year = kwargs['start_year']
-        output_path = kwargs['output_path']
         end_year = kwargs['end_year']
+        regrid_output_path = kwargs['regrid_output_path']
+        native_output_path = kwargs['native_output_path']
         year_set = kwargs['year_set']
         input_path = kwargs['input_path']
         regrid_map_path = kwargs['regrid_map_path']
-        regrid_output_dir = kwargs['regrid_output_dir']
 
         if not self._precheck(year_set, 'ncclimo'):
             return
 
-        set_length = end_year - start_year + 1
-        climo_output_dir = os.path.join(
-            self.output_path,
-            'climo',
-            '{}yr'.format(set_length))
-        if not os.path.exists(climo_output_dir):
-            os.makedirs(climo_output_dir)
-
         config = {
+            'account': self.account,
             'ui': self.ui,
             'run_scripts_path': self.scripts_path,
             'start_year': start_year,
@@ -291,8 +359,8 @@ class RunManager(object):
             'annual_mode': 'sdd',
             'regrid_map_path': regrid_map_path,
             'input_directory': input_path,
-            'climo_output_directory': climo_output_dir,
-            'regrid_output_directory': regrid_output_dir,
+            'climo_output_directory': native_output_path,
+            'regrid_output_directory': regrid_output_path,
             'year_set': year_set.set_number,
         }
         climo = Climo(
@@ -313,29 +381,27 @@ class RunManager(object):
             input_path (str): the path to the raw cam.h0 files
             regrid_map_path (str): the path to the regrid map
             var_list (list(str)): the list of variables to extract
+            regrid_output_path (str): the path to store the regridded timeseries output
+            native_output_path (str): the path to store the native timeseries output
+            filemanager (FileManager): A pointer to the global filemanager
         """
         start_year = kwargs['start_year']
         end_year = kwargs['end_year']
         year_set = kwargs['year_set']
         input_path = kwargs['input_path']
+        regrid_output_path = kwargs['regrid_output_path']
+        native_output_path = kwargs['native_output_path']
         regrid_map_path = kwargs['regrid_map_path']
         var_list = kwargs['var_list']
-        file_list = kwargs['file_list']
+        filemanager = kwargs['filemanager']
 
         if not self._precheck(year_set, 'timeseries'):
             return
 
-        set_length = end_year - start_year + 1
-        timeseries_output_dir = os.path.join(
-            self.output_path,
-            'monthly',
-            '{}yr'.format(set_length))
-        if not os.path.exists(timeseries_output_dir):
-            os.makedirs(timeseries_output_dir)
-
         config = {
+            'account': self.account,
+            'filemanager': filemanager,
             'ui': self.ui,
-            'file_list': file_list,
             'run_scripts_path': self.scripts_path,
             'annual_mode': 'sdd',
             'caseId': self.caseID,
@@ -343,7 +409,8 @@ class RunManager(object):
             'var_list': var_list,
             'start_year': start_year,
             'end_year': end_year,
-            'output_directory': timeseries_output_dir,
+            'regrid_output_directory': regrid_output_path,
+            'native_output_directory': native_output_path,
             'regrid_map_path': regrid_map_path
         }
         timeseries = Timeseries(
@@ -359,6 +426,7 @@ class RunManager(object):
         Add an APrime job to the job_list
 
         Parameters:
+            output_path (str): The path to store the output
             web_directory (str): The path to the directory to store images for hosting
             host_url (str): The url to access the images once their hosted
             year_set (YearSet): The YearSet that this job belongs to
@@ -369,18 +437,23 @@ class RunManager(object):
             test_atm_res (str): the atm resolution for the test input
             test_mpas_mesh_name (str): The test mpas mesh name
             aprime_code_path (str): the path to the aprime code
+            target_host_path (str): the real hosting directory
+            sim_start_year (int): the simulation start year
         """
+        target_host_path = kwargs['target_host_path']
         web_directory = kwargs['web_directory']
         host_url = kwargs['host_url']
         year_set = kwargs['year_set']
         start_year = kwargs['start_year']
         end_year = kwargs['end_year']
         input_base_path = kwargs['input_base_path']
+        output_path = kwargs['output_path']
         resource_path = kwargs['resource_path']
         test_atm_res = kwargs['test_atm_res']
         test_mpas_mesh_name = kwargs['test_mpas_mesh_name']
         aprime_code_path = kwargs['aprime_code_path']
         filemanager = kwargs['filemanager']
+        simulation_start_year = kwargs['simulation_start_year']
 
         if not self._precheck(year_set, 'aprime_diags'):
             return
@@ -389,10 +462,7 @@ class RunManager(object):
             start=start_year,
             end=end_year)
 
-        project_dir = os.path.join(
-            self.output_path,
-            'aprime_diags',
-            year_set_string)
+        project_dir = output_path
         if not os.path.exists(project_dir):
             os.makedirs(project_dir)
 
@@ -419,6 +489,9 @@ class RunManager(object):
             return
 
         config = {
+            'account': self.account,
+            'simulation_start_year': simulation_start_year,
+            'target_host_path': target_host_path,
             'ui': self.ui,
             'web_dir': web_directory,
             'host_url': host_url,
@@ -468,6 +541,7 @@ class RunManager(object):
         host_url = kwargs['host_url']
         regrid_path = kwargs['regrid_path']
         diag_home = kwargs['diag_home']
+        output_path = kwargs['output_path']
 
         if not self._precheck(year_set, 'amwg'):
             return
@@ -475,14 +549,6 @@ class RunManager(object):
         year_set_string = '{start:04d}-{end:04d}'.format(
             start=start_year,
             end=end_year)
-
-        # Setup the amwg output directory
-        output_path = os.path.join(
-            self.output_path,
-            'amwg_diag',
-            year_set_string)
-        if not os.path.exists(output_path):
-            os.makedirs(output_path)
 
         # Setup the AMWG temp directory
         temp_path = os.path.join(
@@ -504,6 +570,8 @@ class RunManager(object):
             return
 
         config = {
+            'short_name': self.short_name,
+            'account': self.account,
             'ui': self.ui,
             'web_dir': web_directory,
             'host_url': host_url,
@@ -554,6 +622,8 @@ class RunManager(object):
         backend = kwargs['backend']
         sets = kwargs['sets']
         resource_path = kwargs['resource_path']
+        output_path = kwargs['output_path']
+        regrid_output_path = kwargs['regrid_output_path']
 
         if not self._precheck(year_set, 'e3sm_diags'):
             msg = 'rejecting e3sm_diags'
@@ -567,13 +637,6 @@ class RunManager(object):
             start=start_year,
             end=end_year)
 
-        # Setup output directory
-        output_path = os.path.join(
-            self.output_path,
-            'e3sm_diags',
-            set_string)
-        if not os.path.exists(output_path):
-            os.makedirs(output_path)
         # Setup temp directory
         temp_path = os.path.join(
             self.output_path,
@@ -593,13 +656,11 @@ class RunManager(object):
             logging.error(msg)
             return
 
-        regrid_path = os.path.join(
-            self.output_path,
-            'climo_regrid')
-
         config = {
+            'short_name': self.short_name,
+            'account': self.account,
             'ui': self.ui,
-            'regrid_base_path': regrid_path,
+            'regrid_output_path': regrid_output_path,
             'web_dir': web_directory,
             'host_url': host_url,
             'experiment': self.caseID,
@@ -620,7 +681,7 @@ class RunManager(object):
         e3sm_diag = E3SMDiags(
             config=config,
             event_list=self.event_list)
-        msg = "Adding ACME Diagnostic to the job list: {}".format(
+        msg = "Adding E3SM Diagnostic to the job list: {}".format(
             str(e3sm_diag))
         logging.info(msg)
         year_set.add_job(e3sm_diag)
@@ -649,7 +710,7 @@ class RunManager(object):
 
         for job_set in self.job_sets:
             # if the job state is ready, but hasnt started yet
-            if job_set.status in [SetStatus.DATA_READY, SetStatus.RUNNING]:
+            if job_set.status in [SetStatus.DATA_READY, SetStatus.RUNNING, SetStatus.FAILED]:
                 # Iterate over all jobs in the set
                 for job in job_set.jobs:
                     if job.status == JobStatus.INVALID:
@@ -680,39 +741,58 @@ class RunManager(object):
                         continue
                     # If the job is valid, start it
                     if job.status == JobStatus.VALID:
-                        if not self.check_max_running_jobs():
-                            slurm = Slurm()
-                            msg = "Submitting {job}".format(job=job.type)
+                        if self.check_max_running_jobs():
+                            return
+                        slurm = Slurm()
+                        msg = "Submitting {job}-{start:04d}-{end:04d}".format(
+                            job=job.type,
+                            start=job.start_year,
+                            end=job.end_year)
+                        print_line(
+                            ui=self.ui,
+                            line=msg,
+                            event_list=self.event_list,
+                            current_state=True,
+                            ignore_text=True)
+                        try:
+                            status = job.execute(dryrun=self._dryrun)
+                        except Exception as e:
+                            # Slurm threw an exception. Reset the job so we can try again
+                            msg = '{job} failed to start execution'.format(
+                                job=job.type)
+                            logging.error(msg)
+                            msg = repr(e)
+                            logging.error(e)
+                            job.status = JobStatus.VALID
+                            continue
+                        if status == -1:
+                            continue
+                        if job.job_id == 0:
+                            msg = '{job}-{start:04d}-{end:04d} precomputed, skipping'.format(
+                                job=job.type,
+                                start=job.start_year,
+                                end=job.end_year)
                             print_line(
                                 ui=self.ui,
                                 line=msg,
                                 event_list=self.event_list)
-                            status = job.execute(dryrun=self._dryrun)
-                            if status == -1:
-                                continue
-                            if job.job_id == 0:
-                                msg = '{job} job already computed, skipping'.format(
-                                    job=job.type)
-                                print_line(
-                                    ui=self.ui,
-                                    line=msg,
-                                    event_list=self.event_list)
-                                logging.info(msg)
-                                continue
-                            try:
-                                slurm.showjob(job.job_id)
-                            except:
-                                msg = "Error submitting {job} to queue".format(job=job.type)
-                                print_line(
-                                    ui=self.ui,
-                                    line=msg,
-                                    event_list=self.event_list)
-                                job.status = JobStatus.VALID
-                                job.status = JobStatus.VALID
-                                return
-                            else:
-                                self.running_jobs.append(job)
-                                self.monitor_running_jobs()
+                            logging.info(msg)
+                            self.handle_completed_job(job)
+                            continue
+                        try:
+                            slurm.showjob(job.job_id)
+                        except:
+                            msg = "Error submitting {job} to queue".format(
+                                job=job.type)
+                            print_line(
+                                ui=self.ui,
+                                line=msg,
+                                event_list=self.event_list)
+                            job.status = JobStatus.VALID
+                            return
+                        else:
+                            self.running_jobs.append(job)
+                            self.monitor_running_jobs()
 
     def monitor_running_jobs(self):
         msg = 'Updating job list'
@@ -798,7 +878,7 @@ class RunManager(object):
             ui=self.ui,
             line=msg,
             event_list=self.event_list,
-            current_state=True)
+            current_state=False)
         job_set = None
         for s in self.job_sets:
             if s.set_number == job.year_set:
@@ -832,20 +912,97 @@ class RunManager(object):
 
         # Finally host the files
         if job.type == 'aprime_diags':
+
             # aprime handles its own hosting
             host_dir = job.config['web_dir']
-            while True:
+            if os.path.exists(host_dir):
                 try:
-                    p = Popen(['chmod', '-R', '0755', host_dir])
-                    out, err = p.communicate()
+                    head, _ = os.path.split(host_dir)
+                    os.chmod(head, 0755)
                 except:
-                    sleep(1)
-                else:
-                    break
-            head, _ = os.path.split(host_dir)
-            os.chmod(head, 0755)
+                    pass
+                while True:
+                    try:
+                        p = Popen(['chmod', '-R', '0755', host_dir])
+                        out, err = p.communicate()
+                    except:
+                        sleep(1)
+                    else:
+                        break
+
+            # move the files from the place that aprime auto
+            # generates them to where we actually want them to be
+            # first make sure the parent directory exists
+            target_host_dir = job.config['target_host_path']
+            head, tail = os.path.split(target_host_dir)
+            if not os.path.exists(head):
+                os.makedirs(head)
+
+            # next copy over the aprime output
+            if os.path.exists(host_dir) and not os.path.isdir(host_dir):
+                if os.path.exists(target_host_dir):
+                    rmtree(target_host_dir)
+                move(src=host_dir,
+                     dst=target_host_dir)
+            elif os.path.exists(job.config['output_path']):
+                if not os.path.exists(target_host_dir):
+                    source = os.path.join(
+                        job.config['output_path'],
+                        'coupled_diagnostics',
+                        '{exp}_vs_obs'.format(exp=job.config['experiment']),
+                        '{exp}_years{start}-{end}_vs_obs'.format(
+                            exp=job.config['experiment'], start=job.start_year, end=job.end_year))
+                    if os.path.exists(source):
+                        copytree(src=source,
+                                 dst=target_host_dir)
+                    else:
+                        msg = 'Unable to find source directory: {}'.format(
+                            source)
+                        logging.error(msg)
+
+            if not os.path.exists(target_host_dir):
+                msg = "Error hosting aprime output for {start:04d}-{end:04d}".format(
+                    start=job.start_year, end=job.end_year)
+                logging.error(msg)
+                return
+
+            if not os.path.exists(os.path.join(target_host_dir, 'index.html')):
+                logging.info(msg)
+                variables = {
+                    'experiment': job.config['experiment'],
+                    'start_year': job.start_year,
+                    'end_year': job.end_year
+                }
+                resource_path = os.path.join(
+                    self._resource_path,
+                    'aprime_index.html')
+                output_path = os.path.join(
+                    target_host_dir,
+                    'index.html')
+                try:
+                    render(
+                        variables=variables,
+                        input_path=resource_path,
+                        output_path=output_path)
+                except:
+                    msg = 'Failed to render index for a-prime'
+                    logging.error(msg)
+
+            if not os.path.exists(os.path.join(target_host_dir, 'acme-banner_1.jpg')):
+                try:
+                    src = os.path.join(self._resource_path,
+                                       'acme-banner_1.jpg')
+                    dst = os.path.join(target_host_dir, 'acme-banner_1.jpg')
+                    copy2(
+                        src=src,
+                        dst=dst)
+                except Exception as e:
+                    msg = 'Failed to copy acme banner from {src} to {dst}'.format(
+                        src=src, dst=dst)
+                    logging.error(msg)
+
             msg = '{job} hosted at {url}/index.html'.format(
-                url=job.config.get('host_url'),
+                url=job.config['host_url'],
                 job=job.type)
             print_line(
                 ui=self.ui,
@@ -861,8 +1018,8 @@ class RunManager(object):
             head, _ = os.path.split(job.config.get('test_path_diag'))
             img_src = os.path.join(head, img_dir)
             self.setup_local_hosting(job, img_src)
-            msg = '{job} hosted at {url}/index.html'.format(
-                url=job.config.get('host_url'),
+            msg = '{job} hosted at {url}'.format(
+                url=job.config['host_url'],
                 job=job.type)
             print_line(
                 ui=self.ui,
@@ -872,8 +1029,8 @@ class RunManager(object):
         elif job.type == 'e3sm_diags':
             img_src = job.config.get('results_dir')
             self.setup_local_hosting(job, img_src)
-            msg = '{job} hosted at {url}/viewer/index.html'.format(
-                url=job.config.get('host_url'),
+            msg = '{job} hosted at {url}'.format(
+                url=job.config['host_url'],
                 job=job.type)
             print_line(
                 ui=self.ui,
@@ -896,10 +1053,8 @@ class RunManager(object):
         host_dir = job.config.get('web_dir')
         url = job.config.get('host_url')
         if os.path.exists(job.config.get('web_dir')):
-            new_id = time.strftime("%Y-%m-%d-%I-%M")
-            host_dir += '_' + new_id
-            url += '_' + new_id + job.host_suffix
-            job.config['host_url'] = url
+            rmtree(job.config.get('web_dir'))
+
         if not os.path.exists(img_src):
             msg = '{job} hosting failed, no image source at {path}'.format(
                 job=job.type,
@@ -915,14 +1070,9 @@ class RunManager(object):
         try:
             msg = 'Copying images from {src} to {dst}'.format(
                 src=img_src, dst=host_dir)
-            print_line(
-                ui=self.ui,
-                line=msg,
-                event_list=self.event_list,
-                current_state=True,
-                ignore_text=False)
             logging.info(msg)
-            copytree(src=img_src, dst=host_dir)
+            if os.path.exists(img_src) and not os.path.exists(host_dir):
+                copytree(src=img_src, dst=host_dir)
 
             msg = 'Fixing permissions for {dir}'.format(
                 dir=host_dir)

@@ -41,6 +41,7 @@ class Climo(object):
         self.end_time = None
         self.output_path = None
         self.inputs = {
+            'account': '',
             'ui': '',
             'start_year': '',
             'end_year': '',
@@ -90,7 +91,7 @@ class Climo(object):
             return 0
         self.config['output_directory'] = self.config['regrid_output_directory']
         self.output_path = self.config['regrid_output_directory']
-
+        self.slurm_args['account'] = self.config.get('account', '')
         if not os.path.exists(self.config.get('run_scripts_path')):
             os.makedirs(self.config.get('run_scripts_path'))
         if self.year_set == 0:
@@ -119,7 +120,7 @@ class Climo(object):
             '-r', self.config['regrid_map_path'],
             '-o', self.config['climo_output_directory'],
             '-O', self.config['regrid_output_directory'],
-            '--no_amwg_links', 
+            '--no_amwg_links',
         ]
         slurm_command = ' '.join(cmd)
 
@@ -186,7 +187,7 @@ class Climo(object):
             input_path=regrid_dir,
             start_year=set_start_year,
             end_year=set_end_year)
-        if len(file_list) < 17:
+        if len(file_list) < 12:
             return False
 
         return True
